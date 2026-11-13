@@ -1,0 +1,807 @@
+---
+title: "VE800-001 Toposcore Analysis"
+author: "Jason Norman"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  comment = NA
+)
+```
+
+# Overview
+
+This report calculates the TOPOSCORE for each VE800-001 metagenomic sample and
+summarizes it over time by cohort and overall response. The TOPOSCORE is a gut
+microbiota score that the source paper linked to immune checkpoint therapy
+(ICT) outcome.
+
+Source paper:
+Derosa L, Iebba V, Silva C ...
+Custom scoring based on ecological topology of gut microbiota associated with
+cancer immunotherapy outcome
+Cell, 187, 3373-3389.e16
+https://www.cell.com/cell/fulltext/S0092-8674(24)00538-5
+
+```{r}
+library(tidyverse)
+library(knitr)
+library(readxl)
+library(here)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(downloadthis)
+
+if (!dir.exists(here("toposcore_analysis", "output"))) dir.create(here("toposcore_analysis", "output"), recursive = TRUE)
+
+# Saves a figure to toposcore_analysis/output/ and returns a download button for it. Call this
+# before printing the plot so the button renders above the figure.
+figure_download_button <- function(plot, filename, width, height) {
+  path <- here("toposcore_analysis", "output", filename)
+  ggsave(path, plot, width = width, height = height, dpi = 300)
+  download_file(
+    path = path,
+    output_name = tools::file_path_sans_ext(filename),
+    button_label = "Download figure (PNG)",
+    button_type = "default",
+    has_icon = TRUE,
+    icon = "fa fa-save"
+  )
+}
+
+response_palette <- c(
+  "#2a78d6", "#eb6834", "#1baf7a", "#eda100",
+  "#e87ba4", "#008300", "#4a3aa7", "#e34948"
+)
+```
+
+# Load data
+
+## Toposcore species relative abundance
+
+Toposcore species (from the paper's supplemental table,
+`mmc2_toposcore_species.xlsx`) were matched to the MetaPhlAn species in Excel
+before import. The workbook has three sheets: exact matches, possible matches
+(names that likely changed between MetaPhlAn database versions), and unmatched
+species. `SIG` gives each species' signature (SIG1 or SIG2) from the paper.
+
+Sample columns are pivoted to long format, and the MGS sample ID is taken from
+each report filename.
+
+```{r import-metaphlan}
+
+metaphlan_path <- here(
+  "toposcore_analysis", "input", "VE800_metaphlan_metaphlan-db_combined_reports.xlsx"
+)
+
+id_cols <- c(
+  "clade_name", "Query name", "Source row", "Name in this file",
+  "Match type", "CLUSTER", "SIG", "Reason"
+)
+
+species_matches <- read_excel(metaphlan_path, sheet = "species matches") |>
+  pivot_longer(
+    cols = !any_of(id_cols),
+    names_to = "filename",
+    values_to = "relative_abundance"
+  ) |>
+  rename(
+    Species.toposcore = "Query name",
+    Species.mpa4 = "Name in this file"
+  ) |> 
+  rename_with(\(x) make.names(x, unique = TRUE)) |> 
+  rename("Cluster" = "CLUSTER")
+
+possible_matches <- read_excel(metaphlan_path, sheet = "possible matches") |>
+  pivot_longer(
+    cols = !any_of(id_cols),
+    names_to = "filename",
+    values_to = "relative_abundance"
+  ) |>
+  rename(
+    Species.toposcore = "Query name",
+    Species.mpa4 = "Name in this file"
+  ) |> 
+  mutate("Match type" = "Partial match") |> 
+  rename_with(\(x) make.names(x, unique = TRUE)) |> 
+  rename("Cluster" = "CLUSTER")
+
+toposcore_species <- species_matches |>
+  bind_rows(possible_matches) |>
+  mutate(MGS.Sample.ID = str_split_i(filename, "_", 1) |> str_sub(1, -3))
+
+no_match <- read_excel(metaphlan_path, sheet = "unmatched species") |> 
+  rename(Species.toposcore = "Query name") |> 
+  mutate("Match type" = "No match", Species.mpa4 = NA) |> 
+  rename_with(\(x) make.names(x, unique = TRUE))
+
+species_distinct <- toposcore_species |> 
+  select(Species.toposcore, Species.mpa4, SIG, Match.type) |> 
+  distinct() |> 
+  bind_rows(no_match)
+
+```
+
+## Clinical metadata {.tabset}
+
+Clinical metadata (`2026-10-07_VE800_metadata_for_paper.csv`) is joined to the
+species data by MGS sample ID. `"NA"` strings are converted to missing values.
+
+Done in the metadata file before import:
+
+- Off-treatment (Off TX) patients are set to `Overall_Response` = `PD`.
+- Patients with `Overall_Response` = `NE` or `NE Restart` are not included.
+
+Excluded samples:
+
+- MetaPhlAn files with no match in the metadata (no visit assignment).
+- Samples with a missing visit name.
+- End-of-treatment (EOT) samples, which are not pre-specified timepoints.
+
+Timepoints: all summaries, plots, and models use `Visit.Name.Norm`
+("Timepoint" in figures and tables), which converts each cycle-day visit to
+its study day:
+
+| Visit.Name | Visit.Name.Norm (Timepoint) |
+|---|---|
+| Screen | Screen |
+| Baseline | Baseline |
+| C1D1 | D1 |
+| C1D3 | D3 |
+| C1D7 | D7 |
+| C1D14 | D14 |
+| C1D21 | D21 |
+| C2D1 | D30 |
+| C3D1 | D58 |
+| C4D1 | D86 |
+| C5D1 | D114 |
+| C6D1 | D142 |
+| C7D1 | D170 |
+| C8D1 | D198 |
+| C10D1 | D254 |
+
+```{r import-clinical}
+mgs_metadata <- read_csv(
+  here("toposcore_analysis", "input", "2026-10-07_VE800_metadata_for_paper.csv")
+)
+
+# inner_join drops MetaPhlAn files with no matching sample in the metadata
+toposcore_species_clinical <- toposcore_species |>
+  inner_join(mgs_metadata, by = "MGS.Sample.ID") |>
+  arrange(Subject_ID, Timepoint, SIG, Species.toposcore) |>
+  mutate(
+    Overall_Response = if_else(
+      Overall_Response == "NA", NA, Overall_Response
+    )
+  ) |>
+  mutate(
+    Visit.Name = if_else(
+      Visit.Name == "NA", NA, Visit.Name
+    )
+  ) |> 
+  filter(Visit.Name != "EOT") # EOT samples are not included in the analysis because they are not pre-specified timepoints and are not available for all subjects.
+
+# Set visit order for plotting and tables
+visit_name_levels <- c(
+  "Screen", "Baseline", "C1D1", "C1D3", "C1D7", "C1D14", "C1D21",
+  "C2D1", "C3D1", "C4D1", "C5D1", "C6D1", "C7D1", "C8D1", "C10D1", "EOT"
+)
+visit_name_norm_levels <- c(
+  "Screen", "Baseline", "D1", "D3", "D7", "D14", "D21", "D30",
+  "D58", "D86", "D114", "D142", "D170", "D198", "D254", "EOT"
+)
+
+# factor() silently turns values missing from the levels into NA
+unlisted_visits <- c(
+  setdiff(toposcore_species_clinical$Visit.Name, visit_name_levels),
+  setdiff(toposcore_species_clinical$Visit.Name.Norm, visit_name_norm_levels)
+)
+if (length(unlisted_visits) > 0) {
+  stop(
+    "Visits missing from the factor levels: ",
+    paste(unique(unlisted_visits), collapse = ", ")
+  )
+}
+
+toposcore_species_clinical <- toposcore_species_clinical |>
+  mutate(
+    Visit.Name = factor(Visit.Name, levels = visit_name_levels),
+    Visit.Name.Norm = factor(Visit.Name.Norm, levels = visit_name_norm_levels)
+  )
+
+# Count the final number of metagenome files included in the analysis
+num_metagenome_files <- toposcore_species_clinical |>
+  group_by(Cohort, Overall_Response) |>
+  distinct(filename) |>
+  summarize(N_files = n())
+
+num_subjects <- toposcore_species_clinical |>
+  group_by(Cohort, Overall_Response) |>
+  distinct(Subject_ID) |>
+  summarize(N_subjects = n())
+```
+
+### Number of Subjects Included in the Analysis
+
+```{r}
+kable(num_subjects, caption = "Number of subjects included in the analysis by cohort and overall response")
+```
+
+### Number of Metagenome Files Included in the Analysis
+```{r}
+kable(num_metagenome_files, caption = "Number of metagenome files included in the analysis by cohort and overall response")
+```
+
+### Toposcore species detected
+
+```{r}
+summary_species <- species_distinct |> 
+  group_by(SIG, Match.type) |>
+  summarise(n_species = n())  |> 
+  ungroup() |>
+  pivot_wider(
+    names_from = SIG,
+    values_from = n_species,
+    values_fill = 0
+  ) 
+
+kable(summary_species, caption = "Toposcore species detected in VE800-001 metagenomic samples")
+```
+
+# TOPOSCORE calculation
+
+From the paper:
+
+> S score computed as the difference of proportions between present (relative
+> abundance > 0) SIG2 and SIG1 MGS and scaled from 0 to 1:
+> S = (#SIG2/45 - #SIG1/37 + 1)/2. A score of 0 indicates that all MGS of the
+> SIG1 signature have strictly positive relative abundances and all MGS of the
+> SIG2 signature have null relative abundances. Conversely, a score of 1
+> indicates that all MGS of the SIG1 signature have null relative abundances and
+> all MGS of the SIG2 signature have strictly positive relative abundances.
+
+- SIG1: 37 species associated with poor ICT response
+- SIG2: 45 species associated with good ICT response
+
+The TOPOSCORE also counts Akkermansia (`Akkermansia SGB 9226`) in every
+sample, including when absent:
+
+- **Normal** (> 0% to 4.799%): SIG2
+- **High** (> 4.799%): SIG1
+- **Absent** (0%): SIG1
+
+All other species count only when present (relative abundance > 0). Because
+Akkermansia adds one species to either signature, both denominators increase
+by one:
+
+TOPOSCORE = (#SIG2/46 - #SIG1/38 + 1)/2
+
+From the paper:
+
+> Normal levels of Akk (0 < Akk % 4.799%, Akknorm) may be considered as a surrogate of host fitness in comparison with abnormal levels (Akk R 4.8%, Akkhigh) or the absence of Akk (Akk0). Starting from here, gray zone patients who harbored physiological Akk levels (about 19% of the whole cohort) were incorporated into the SIG2 category (to create the ‘‘SIG2+’’ group), while gray zone patients devoid of (Akk0)or harboring supraphysiologically high Akk levels (23% and 4% of the whole cohort, respectively) were incorporated into the SIG1 category (to create the ‘‘SIG1+’’ group).
+
+```{r calc-toposcores}
+calc_toposcores <- toposcore_species_clinical |>
+  mutate(
+    is_akk = Species.toposcore == "Akkermansia SGB 9226",
+    SIG_plus = case_when(
+      is_akk & relative_abundance > 0 & relative_abundance <= 4.799 ~ "SIG2",
+      is_akk & relative_abundance > 4.799 ~ "SIG1",
+      is_akk & relative_abundance == 0 ~ "SIG1",
+      TRUE ~ SIG
+    ),
+    # Other species count only when present; absent Akkermansia counts as SIG1
+    counted = relative_abundance > 0 | (is_akk & relative_abundance == 0)
+  ) |>
+  group_by(
+    Subject_ID, Timepoint, Visit.Name, Visit.Name.Norm, MGS.Sample.ID,
+    Cohort, Response_Wk8, Response_Wk16, Response_Wk24, Response_Wk32,
+    Response_Wk40, Overall_Response
+  ) |>
+  summarise(
+    SIG1_count = sum(SIG_plus == "SIG1" & counted),
+    SIG2_count = sum(SIG_plus == "SIG2" & counted),
+    # Denominators include Akkermansia, which can count toward either signature
+    TOPOSCORE = (SIG2_count / 46 - SIG1_count / 38 + 1) / 2,
+    .groups = "drop"
+  ) |>
+  arrange(Subject_ID, Visit.Name.Norm)
+```
+
+
+# TOPOSCORE summary {.tabset}
+
+TOPOSCOREs by cohort and timepoint. In the figure, thin lines are individual
+subjects and bold lines are the mean ± SE for each overall response.
+
+## TOPOSCORE over time
+
+```{r toposcore-plot, fig.width = 10, fig.height = 6}
+toposcore_plot <- calc_toposcores |>
+  filter(!is.na(Cohort)) |>
+  ggplot(aes(Visit.Name.Norm, TOPOSCORE, color = Overall_Response)) +
+  geom_line(aes(group = Subject_ID), alpha = 0.25, linewidth = 0.4) +
+  stat_summary(
+    aes(group = Overall_Response),
+    fun = mean, geom = "line", linewidth = 1
+  ) +
+  stat_summary(
+    aes(group = Overall_Response),
+    fun.data = mean_se, geom = "pointrange", size = 0.4
+  ) +
+  facet_wrap(vars(Cohort), scales = "free_x") +
+  scale_color_manual(values = response_palette) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = "Timepoint",
+    y = "TOPOSCORE",
+    color = "Overall response",
+    title = "TOPOSCORE over time by cohort and overall response",
+    subtitle = "Thin lines: individual subjects; bold lines: mean ± SE"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top"
+  )
+
+figure_download_button(
+  toposcore_plot, "toposcore_over_time_by_cohort_and_response.png",
+  width = 10, height = 6
+)
+
+toposcore_plot
+```
+
+## Summary table
+
+```{r toposcore-summary-table}
+toposcore_summary <- calc_toposcores |>
+  group_by(Cohort, Visit.Name.Norm) |>
+  summarise(
+    n = n(),
+    mean = mean(TOPOSCORE, na.rm = TRUE),
+    sd = sd(TOPOSCORE, na.rm = TRUE),
+    median = median(TOPOSCORE, na.rm = TRUE),
+    q1 = quantile(TOPOSCORE, 0.25, na.rm = TRUE),
+    q3 = quantile(TOPOSCORE, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+toposcore_summary |>
+  mutate(across(mean:q3, \(x) round(x, 3))) |>
+  kable(caption = "TOPOSCORE by cohort and timepoint")
+```
+
+# LME model of TOPOSCORE over time {.tabset}
+
+A linear mixed effects model is fit separately for each cohort to test for
+change from Baseline:
+
+`TOPOSCORE ~ Visit.Name.Norm + (1 | Subject_ID)`
+
+- Timepoint is categorical, with Baseline as the reference.
+- A random intercept per subject handles repeated samples. Cohorts are too
+  small for random slopes.
+- Timepoints with fewer than 3 subjects in a cohort are dropped.
+- Each timepoint is compared with Baseline using emmeans (Satterthwaite df).
+  P-values and CIs use `adjust = "dunnettx"`, a close approximation of
+  Dunnett's adjustment, within each cohort (not across cohorts).
+- Subjects without a Baseline sample still contribute through their other
+  timepoints.
+
+**Statistical outcome** (Dunnett-adjusted)
+
+- TOPOSCORE changes over time in all three cohorts (timepoint F-test
+  p < 0.001 in CRC, Gastric, and Melanoma).
+- Screen and Baseline do not differ in any cohort (−0.010 to +0.007, all
+  p > 0.99), so pre-treatment scores are stable.
+- In every cohort, TOPOSCORE **decreases** after treatment starts (a less
+  favorable SIG1/SIG2 balance).
+- **Melanoma** (20 subjects): significant decrease at every timepoint from D1
+  through D170 (about −0.09 to −0.18; p ≤ 0.01), with no return to Baseline.
+- **Gastric** (20 subjects): significant decrease from D1 through D30 (about
+  −0.13 to −0.17; p < 0.001). D58 is not significant (−0.086, p = 0.19).
+- **CRC** (14 subjects): smaller decrease, significant from D3 through D30
+  (about −0.07 to −0.11; p ≤ 0.02). D1 is borderline (−0.066, p = 0.06).
+  From D58 on, no timepoint differs from Baseline (all p > 0.4), suggesting
+  partial recovery.
+- All CRC and Gastric subjects are PD, so overall response is examined only
+  in Melanoma.
+
+```{r lme-fit}
+min_subjects <- 3
+
+lme_data <- calc_toposcores |>
+  filter(!is.na(Cohort)) |>
+  group_by(Cohort, Visit.Name.Norm) |>
+  filter(n_distinct(Subject_ID) >= min_subjects) |>
+  ungroup()
+
+fit_cohort_lme <- function(df) {
+  if (!"Baseline" %in% df$Visit.Name.Norm) {
+    stop("No Baseline timepoint with >= ", min_subjects, " subjects in a cohort")
+  }
+  df <- df |>
+    mutate(Visit.Name.Norm = fct_relevel(fct_drop(Visit.Name.Norm), "Baseline"))
+  lmer(TOPOSCORE ~ Visit.Name.Norm + (1 | Subject_ID), data = df, REML = TRUE)
+}
+
+# Baseline is releveled to first, so ref = 1 is Baseline
+baseline_contrasts <- function(model) {
+  emmeans(model, ~ Visit.Name.Norm, lmer.df = "satterthwaite") |>
+    contrast(method = "trt.vs.ctrl", ref = 1, adjust = "dunnettx") |>
+    summary(infer = TRUE) |>
+    as_tibble()
+}
+
+lme_fits <- lme_data |>
+  nest(.by = Cohort) |>
+  mutate(
+    model = map(data, fit_cohort_lme),
+    singular = map_lgl(model, isSingular),
+    n_subjects = map_int(data, \(d) n_distinct(d$Subject_ID)),
+    n_samples = map_int(data, nrow),
+    visit_anova = map(model, \(m) as_tibble(anova(m))),
+    contrasts = map(model, baseline_contrasts)
+  )
+
+lme_contrasts <- lme_fits |>
+  select(Cohort, contrasts) |>
+  unnest(contrasts) |>
+  mutate(
+    Visit.Name.Norm = factor(
+      str_remove(contrast, " - Baseline"),
+      levels = visit_name_norm_levels
+    ),
+    significant = p.value < 0.05
+  ) |>
+  arrange(Cohort, Visit.Name.Norm)
+```
+
+## Overall timepoint effect
+
+Type III F-test of timepoint within each cohort. A significant result means
+TOPOSCORE differs across timepoints; the contrasts show where. A singular fit
+means the subject-level variance was estimated as zero.
+
+```{r lme-anova}
+lme_fits |>
+  select(Cohort, n_subjects, n_samples, singular, visit_anova) |>
+  unnest(visit_anova) |>
+  select(
+    Cohort, n_subjects, n_samples, singular,
+    num_df = NumDF, den_df = DenDF, F_value = `F value`, p_value = `Pr(>F)`
+  ) |>
+  mutate(across(c(den_df, F_value), \(x) round(x, 2)), p_value = signif(p_value, 3)) |>
+  kable(caption = "Overall effect of timepoint on S score, by cohort")
+```
+
+## Contrasts vs Baseline
+
+Estimated TOPOSCORE at each timepoint minus Baseline, with Dunnett-adjusted
+95% CI and p-value.
+
+```{r lme-contrasts}
+lme_contrasts |>
+  select(Cohort, contrast, estimate, SE, df, lower.CL, upper.CL, p.value) |>
+  mutate(
+    across(c(estimate, SE, lower.CL, upper.CL), \(x) round(x, 3)),
+    df = round(df, 1),
+    p.value = signif(p.value, 3)
+  ) |>
+  kable(caption = "TOPOSCORE change from Baseline by timepoint (LME, Dunnett-adjusted)")
+```
+
+## LME contrast plot - all cohorts
+
+```{r lme-contrast-plot, fig.width = 10, fig.height = 5}
+lme_contrast_plot <- lme_contrasts |>
+  ggplot(aes(Visit.Name.Norm, estimate, color = significant)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#898781") +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.2) +
+  geom_point(size = 2.5) +
+  facet_wrap(vars(Cohort), scales = "free_x") +
+  scale_color_manual(
+    values = c("FALSE" = "#898781", "TRUE" = "#2a78d6"),
+    labels = c("FALSE" = "Not significant", "TRUE" = "Adjusted p < 0.05"),
+    name = NULL
+  ) +
+  labs(
+    x = "Timepoint",
+    y = "Change in TOPOSCORE from Baseline",
+    title = "Estimated change in TOPOSCORE from Baseline, by cohort",
+    subtitle = "LME estimates with Dunnett-adjusted 95% CI and p-values"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top"
+  )
+
+figure_download_button(
+  lme_contrast_plot, "lme_toposcore_change_from_baseline.png",
+  width = 10, height = 5
+)
+
+lme_contrast_plot
+```
+
+
+
+# LME model of Melanoma TOPOSCORE with overall response {.tabset}
+
+For Melanoma only, a timepoint × overall response interaction model is fit, so
+each response group has its own trajectory:
+
+`TOPOSCORE ~ Visit.Name.Norm * Overall_Response + (1 | Subject_ID)`
+
+- Subjects with a missing `Overall_Response` are excluded.
+- A timepoint is kept only if every response group has at least
+  `r min_subjects` subjects there. The first tab shows the resulting counts.
+- The most common response group is the reference.
+- Three sets of comparisons:
+  - **Change from Baseline by response:** Dunnett-adjusted within each group.
+  - **Response difference by timepoint:** unadjusted.
+  - **Difference in change from Baseline** (interaction contrast):
+    Dunnett-adjusted across timepoints.
+
+Group sizes are small; treat estimates from cells with few subjects as
+descriptive.
+
+**Statistical outcome** (12 PD and 8 SD subjects, Baseline through D58)
+
+- The timepoint × response interaction is significant (F = 3.87, p < 0.001):
+  PD and SD follow different trajectories.
+- The response main effect is not significant (F = 1.06, p = 0.32), but this
+  average over timepoints hides the timepoint-dependent difference.
+- **SD starts higher:** SD is above PD at Baseline (+0.10, p = 0.002) and D1
+  (+0.11, p < 0.001). From D3 on, the groups do not differ (all p > 0.2).
+- **Both groups decrease from Baseline:**
+  - PD: about −0.10 to −0.13 from D1 through D30 (all p < 0.001). D58 is not
+    significant (−0.074, p = 0.28; only 3 PD subjects).
+  - SD: −0.088 at D1 (p = 0.03), then about −0.20 to −0.24 from D3 through
+    D58 (all p < 0.001).
+- **SD decreases more:** the difference is significant at D21 (−0.12,
+  p = 0.04), D30 (−0.14, p = 0.006), and D58 (−0.15, p = 0.01), but not from
+  D1 through D14.
+- In short, SD subjects start with a higher TOPOSCORE but lose that advantage
+  by D3.
+
+```{r melanoma-lme-fit}
+melanoma_data <- calc_toposcores |>
+  filter(Cohort == "Melanoma", !is.na(Overall_Response)) |>
+  mutate(Overall_Response = fct_drop(factor(Overall_Response)))
+
+# Keep visits where every response group has enough subjects
+melanoma_kept_visits <- melanoma_data |>
+  distinct(Visit.Name.Norm, Overall_Response, Subject_ID) |>
+  count(Visit.Name.Norm, Overall_Response) |>
+  complete(Visit.Name.Norm, Overall_Response, fill = list(n = 0)) |>
+  group_by(Visit.Name.Norm) |>
+  filter(all(n >= min_subjects)) |>
+  distinct(Visit.Name.Norm) |>
+  pull(Visit.Name.Norm)
+
+if (!"Baseline" %in% melanoma_kept_visits) {
+  stop(
+    "Baseline does not have >= ", min_subjects,
+    " subjects in every Melanoma response group"
+  )
+}
+
+melanoma_data <- melanoma_data |>
+  filter(Visit.Name.Norm %in% melanoma_kept_visits) |>
+  mutate(
+    Visit.Name.Norm = fct_relevel(fct_drop(Visit.Name.Norm), "Baseline"),
+    # Most frequent response becomes the reference level
+    Overall_Response = fct_infreq(Overall_Response)
+  )
+
+melanoma_model <- lmer(
+  TOPOSCORE ~ Visit.Name.Norm * Overall_Response + (1 | Subject_ID),
+  data = melanoma_data, REML = TRUE
+)
+
+melanoma_emm_grid <- emmeans(
+  melanoma_model, ~ Visit.Name.Norm * Overall_Response,
+  lmer.df = "satterthwaite"
+)
+
+contrast_table <- function(x) {
+  summary(x, infer = TRUE) |> as_tibble()
+}
+
+melanoma_visit_contrasts <- melanoma_emm_grid |>
+  contrast(
+    method = "trt.vs.ctrl", ref = 1, by = "Overall_Response",
+    adjust = "dunnettx"
+  ) |>
+  contrast_table()
+
+melanoma_response_contrasts <- melanoma_emm_grid |>
+  contrast(method = "revpairwise", by = "Visit.Name.Norm", adjust = "none") |>
+  contrast_table()
+
+# Columns 1:2 hold the visit and response contrast labels
+melanoma_interaction_contrasts <- melanoma_emm_grid |>
+  contrast(interaction = c("trt.vs.ctrl", "revpairwise"), adjust = "dunnettx") |>
+  contrast_table() |>
+  unite("contrast", 1:2, sep = ", ")
+
+melanoma_emm <- as_tibble(melanoma_emm_grid) |>
+  mutate(Visit.Name.Norm = factor(Visit.Name.Norm, levels = visit_name_norm_levels))
+```
+
+## Subjects by response and timepoint
+
+```{r melanoma-lme-counts}
+melanoma_data |>
+  distinct(Overall_Response, Visit.Name.Norm, Subject_ID) |>
+  count(Overall_Response, Visit.Name.Norm) |>
+  mutate(Visit.Name.Norm = factor(Visit.Name.Norm, levels = visit_name_norm_levels)) |>
+  arrange(Visit.Name.Norm) |>
+  pivot_wider(names_from = Visit.Name.Norm, values_from = n, values_fill = 0) |>
+  left_join(
+    count(distinct(melanoma_data, Overall_Response, Subject_ID),
+          Overall_Response, name = "Total subjects"),
+    by = "Overall_Response"
+  ) |>
+  kable(caption = "Melanoma subjects per overall response and timepoint (timepoints used in the model)")
+```
+
+## Model tests
+
+Type III F-tests for timepoint, overall response, and their interaction. A
+significant interaction means trajectories differ between response groups; if
+so, the main effects are not interpreted on their own.
+
+```{r melanoma-lme-anova}
+as_tibble(anova(melanoma_model), rownames = "term") |>
+  select(
+    term, num_df = NumDF, den_df = DenDF,
+    F_value = `F value`, p_value = `Pr(>F)`
+  ) |>
+  mutate(
+    across(c(den_df, F_value), \(x) round(x, 2)),
+    p_value = signif(p_value, 3),
+    singular_fit = isSingular(melanoma_model)
+  ) |>
+  kable(caption = "Melanoma: timepoint × overall response effects on TOPOSCORE")
+```
+
+## Change from Baseline by response
+
+Estimated change from Baseline within each response group (Dunnett-adjusted
+within group).
+
+```{r melanoma-lme-visits}
+format_contrasts <- function(tbl, ...) {
+  tbl |>
+    select(..., contrast, estimate, SE, df, lower.CL, upper.CL, p.value) |>
+    mutate(
+      across(c(estimate, SE, lower.CL, upper.CL), \(x) round(x, 3)),
+      df = round(df, 1),
+      p.value = signif(p.value, 3)
+    )
+}
+
+melanoma_visit_contrasts |>
+  format_contrasts(Overall_Response) |>
+  kable(
+    caption = "Melanoma: TOPOSCORE change from Baseline by response (Dunnett-adjusted)"
+  )
+```
+
+## Response difference by timepoint
+
+Estimated difference between response groups at each timepoint (unadjusted).
+
+```{r melanoma-lme-response}
+melanoma_response_contrasts |>
+  format_contrasts(Visit.Name.Norm) |>
+  kable(caption = "Melanoma: TOPOSCORE difference between response groups by timepoint")
+```
+
+## Difference in change from Baseline
+
+Difference between response groups in change from Baseline. For example,
+"D7 - Baseline, SD - PD" is SD's change to D7 minus PD's change
+(Dunnett-adjusted across timepoints).
+
+```{r melanoma-lme-interaction}
+melanoma_interaction_contrasts |>
+  format_contrasts() |>
+  kable(
+    caption = "Melanoma: difference between response groups in change from Baseline"
+  )
+```
+
+## LME contrast plot - Melanoma
+
+Lines are model-estimated means with 95% CIs; points are observed TOPOSCOREs.
+
+```{r melanoma-lme-plot, fig.width = 9, fig.height = 5}
+melanoma_lme_plot <- ggplot(
+  melanoma_emm,
+  aes(Visit.Name.Norm, emmean, color = Overall_Response, group = Overall_Response)
+) +
+  geom_point(
+    data = mutate(
+      melanoma_data,
+      Visit.Name.Norm = factor(Visit.Name.Norm, levels = visit_name_norm_levels)
+    ),
+    aes(y = TOPOSCORE),
+    alpha = 0.35, size = 1.5,
+    position = position_jitterdodge(jitter.width = 0.1, dodge.width = 0.5)
+  ) +
+  geom_line(position = position_dodge(width = 0.5), linewidth = 1) +
+  geom_pointrange(
+    aes(ymin = lower.CL, ymax = upper.CL),
+    position = position_dodge(width = 0.5), size = 0.4
+  ) +
+  scale_color_manual(values = response_palette) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = "Timepoint",
+    y = "TOPOSCORE",
+    color = "Overall response",
+    title = "Melanoma: model-estimated TOPOSCORE by timepoint and overall response",
+    subtitle = "LME timepoint × response interaction model; estimated means with 95% CI"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top"
+  )
+
+figure_download_button(
+  melanoma_lme_plot, "lme_melanoma_toposcore_by_response.png",
+  width = 9, height = 5
+)
+
+melanoma_lme_plot
+```
+
+# Export
+
+Per-sample TOPOSCOREs, the summary table, and the model contrasts are written
+to `toposcore_analysis/output/`. Figures are saved there as each plot is drawn.
+
+```{r export}
+write_csv(calc_toposcores,here("toposcore_analysis", "output", "toposcores.csv"))
+write_csv(toposcore_summary, here("toposcore_analysis", "output", "toposcore_summary.csv"))
+write_csv(
+  select(lme_contrasts, -significant),
+  here("toposcore_analysis", "output", "lme_toposcore_contrasts_vs_baseline.csv")
+)
+write_csv(
+  bind_rows(
+    mutate(
+      melanoma_visit_contrasts,
+      comparison = "visit vs Baseline within response"
+    ),
+    mutate(melanoma_response_contrasts, comparison = "response by visit"),
+    mutate(
+      melanoma_interaction_contrasts,
+      comparison = "difference in change from Baseline"
+    )
+  ),
+  here("toposcore_analysis", "output", "lme_melanoma_response_contrasts.csv")
+)
+
+```
