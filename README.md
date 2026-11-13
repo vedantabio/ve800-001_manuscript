@@ -208,3 +208,40 @@ For each VE800 strain, a penalised ordinal (cumulative-logit) elastic-net model 
 
 ---
 
+
+## TOPOSCORE analysis (`ve800-001_toposcore_ms_only.rmd`)
+
+A separate, self-contained R Markdown report that calculates the TOPOSCORE (Derosa et al., *Cell* 2024, 187:3373–3389.e16) for each VE800-001 metagenomic stool sample and models how it changes over time by cohort and by overall clinical response. It does not depend on the `scripts/` pipeline above. Full details are in [`toposcore_analysis/README_toposcore.md`](toposcore_analysis/README_toposcore.md).
+
+**Run:** open `ve800-001_toposcore_ms_only.rmd` in RStudio and click **Knit**, or from the project root:
+
+```bash
+Rscript -e 'rmarkdown::render("ve800-001_toposcore_ms_only.rmd")'
+```
+
+Required packages: `tidyverse`, `readxl`, `knitr`, `here`, `rmarkdown`, `lme4`, `lmerTest`, `emmeans`, `downloadthis`. The knitted report is `ve800-001_toposcore_ms_only.html`.
+
+**What it does**
+
+1. Imports MetaPhlAn 4 relative abundances for the toposcore species and joins the clinical metadata (excludes unmatched files, missing visits and end-of-treatment samples).
+2. Computes `TOPOSCORE = (#SIG2/46 − #SIG1/38 + 1) / 2`, with *Akkermansia* counted in SIG1 or SIG2 depending on its abundance.
+3. Summarizes TOPOSCORE over time by cohort and response.
+4. Fits LME models (`lme4`/`lmerTest`, random intercept per subject; `emmeans` contrasts):
+   - change from Baseline within each cohort;
+   - melanoma only: timepoint × overall response.
+
+```
+toposcore_analysis/
+├── README_toposcore.md     # detailed methods, timepoint mapping, outputs
+├── input/                  # input data (not modified by the report)
+│   ├── VE800_metaphlan_metaphlan-db_combined_reports.xlsx   # MetaPhlAn abundances
+│   └── 2026-10-07_VE800_metadata_for_paper.csv              # sample + clinical metadata
+└── output/                 # regenerated on knit
+    ├── toposcores.csv                                    # per-sample SIG1/SIG2 counts and TOPOSCORE
+    ├── toposcore_summary.csv                             # n, mean, SD, median, IQR by cohort and timepoint
+    ├── toposcore_over_time_by_cohort_and_response.png    # trajectories and mean ± SE by response
+    ├── lme_toposcore_contrasts_vs_baseline.csv           # each timepoint vs Baseline, per cohort
+    ├── lme_toposcore_change_from_baseline.png
+    ├── lme_melanoma_response_contrasts.csv               # melanoma timepoint × response contrasts
+    └── lme_melanoma_toposcore_by_response.png
+```
