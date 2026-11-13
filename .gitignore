@@ -1,0 +1,18 @@
+# ---- Raw data: never commit (patient-level source files) ----
+data/
+
+# ---- Generated results: regenerate with run_all.R ----
+Results/
+Rplots.pdf
+
+# ---- R / RStudio ----
+.Rhistory
+.RData
+.Rapp.history
+.Ruserdata
+.Rproj.user/
+*.Rproj.user
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
